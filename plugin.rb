@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-#
+
 # name: discourse-quizbook-bridge
 # about: Bridges Mia's Quiz Tournament with Discourse — sidebar QOTD widget, cross-site link injection, /quizbook/qotd JSON alias.
 # version: 0.1.0
