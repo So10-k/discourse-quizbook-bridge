@@ -1,0 +1,20 @@
+// Styling for embedded Quiz Book widgets in Discourse posts.
+// The iframe itself carries inline styles for the picture-book
+// border + pop shadow; this file just controls the surrounding
+// container and responsive sizing.
+
+.qb-widget {
+  margin: 16px 0;
+  width: 100%;
+  display: block;
+
+  iframe {
+    background: transparent;
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+.qb-widget-qotd iframe { min-height: 280px; }
+.qb-widget-bracket iframe { min-height: 480px; }
+.qb-widget-standings iframe { min-height: 360px; }

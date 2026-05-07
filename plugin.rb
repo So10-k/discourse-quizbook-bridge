@@ -1,11 +1,18 @@
 # frozen_string_literal: true
 
 # name: discourse-quizbook-bridge
-# about: Bridges Mia's Quiz Tournament with Discourse — sidebar QOTD widget, cross-site link injection, /quizbook/qotd JSON alias.
-# version: 0.1.0
+# about: Bridges Mia's Quiz Tournament with Discourse — embeddable widgets ([quizbook-bracket], [quizbook-qotd], [quizbook-standings]), QOTD passthrough, cross-site link.
+# version: 0.2.0
 # authors: Sam
 # url: https://quiz.miaswebsites.art
 # required_version: 3.2.0
+
+# Tell Discourse about the markdown extension that powers our embed
+# shortcodes. Discourse auto-loads JS under
+# assets/javascripts/discourse-markdown/, but registering it here as a
+# named extension is required so it runs through the cooked-HTML
+# allowlist + sanitizer.
+register_asset "stylesheets/quizbook-widgets.scss"
 
 enabled_site_setting :quizbook_bridge_enabled
 
