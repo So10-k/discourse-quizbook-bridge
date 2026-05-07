@@ -1,0 +1,3 @@
+en:
+  site_settings:
+    quizbook_bridge_enabled: "Enable the Quiz Book bridge plugin (sidebar QOTD widget + cross-site link injection)."

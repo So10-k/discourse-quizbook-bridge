@@ -1,0 +1,5 @@
+plugins:
+  quizbook_bridge_enabled:
+    default: true
+    client: true
+    description: "Enable the Quiz Book bridge — exposes /quizbook/qotd and decorates the sidebar."
