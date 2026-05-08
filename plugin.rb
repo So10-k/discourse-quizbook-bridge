@@ -1002,22 +1002,36 @@ after_initialize do
         next
       end
 
-      # (e) @support_bot commands inside the Support Tickets category.
-      # Only fires when the post is in a topic flagged as a support
-      # ticket AND the actor is an admin/author. The bot ignores
-      # commands anywhere else (so admins can't accidentally trigger
-      # bot actions outside the ticket area).
+      # (e) @support_bot commands. The bot handles two scopes:
+      #   • TICKET commands (respond / internalnote / changestatus)
+      #     only fire inside the Support Tickets category.
+      #   • GLOBAL commands (lookup / help) fire in any topic.
+      # Both require the actor to be an admin or in the authors group.
       support_cat = ::DiscourseQuizbook.find_support_tickets_category
       bot = ::DiscourseQuizbook.support_bot_user
-      if topic.category_id && support_cat && bot &&
-         topic.category_id == support_cat.id &&
-         (user.admin? || user.groups.exists?(name: "authors"))
+      if bot && (user.admin? || user.groups.exists?(name: "authors"))
         clean = ::DiscourseQuizbook.strip_markdown(raw)
         # Match: @support_bot <command> <rest>
         cmd_match = clean.match(/@#{Regexp.escape(bot.username)}\s+(\w+)\s*(.*)/im)
         next unless cmd_match
         cmd = cmd_match[1].downcase
         body_arg = cmd_match[2].strip
+
+        # Ticket commands require the support tickets category.
+        ticket_cmds = %w[respond reply internalnote note internal changestatus status setstatus]
+        if ticket_cmds.include?(cmd) &&
+           !(support_cat && topic.category_id == support_cat.id)
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw:
+              "🤔 `#{cmd}` only works inside the **Support Tickets** " \
+              "category. Use `@#{bot.username} lookup [@user|email]` " \
+              "anywhere, or `@#{bot.username} help` for the full list.",
+            skip_validations: true,
+          )
+          next
+        end
 
         case cmd
         when "respond", "reply"
@@ -1131,45 +1145,20 @@ after_initialize do
           )
           next
 
-        when "help"
-          PostCreator.create!(
-            bot,
-            topic_id: topic.id,
-            raw:
-              "**Support bot commands** (use inside this category only):\n\n" \
-              "- `@support_bot respond [message]` — emails the submitter\n" \
-              "- `@support_bot internalnote [text]` — adds a staff-only note\n" \
-              "- `@support_bot changestatus [open|pending|resolved|closed]`\n" \
-              "- `@support_bot help` — this message",
-            skip_validations: true,
-          )
-          next
-
-        else
-          PostCreator.create!(
-            bot,
-            topic_id: topic.id,
-            raw: "🤔 Unknown command `#{cmd}`. Try `@support_bot help`.",
-            skip_validations: true,
-          )
-          next
-        end
-      end
-
-      # (f) @lookup command — works in ANY topic (PMs included),
-      # only fires when the actor is in the authors group. Argument
-      # is either a @username or a raw email. Bot replies with a
-      # whisper-style card combining Discourse + quiz-site info.
-      if user.groups.exists?(name: "authors")
-        clean = ::DiscourseQuizbook.strip_markdown(raw)
-        lookup_match =
-          clean.match(/@lookup\s+@?([\w@.\-+]+)/im) ||
-          clean.match(/^lookup\s+@?([\w@.\-+]+)/im)
-        if lookup_match
-          target = lookup_match[1]
+        when "lookup"
+          target = body_arg.split(/\s+/).first.to_s
+          if target.empty?
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: "🤔 Usage: `@#{bot.username} lookup @username` or `@#{bot.username} lookup email@example.com`",
+              skip_validations: true,
+            )
+            next
+          end
           card = ::DiscourseQuizbook.build_lookup_card(target)
           # Whisper if possible (staff-only); fall back to a regular
-          # post if whispers are disabled.
+          # post so non-whisper-enabled installs still see the card.
           begin
             PostCreator.create!(
               Discourse.system_user,
@@ -1187,11 +1176,38 @@ after_initialize do
             )
           end
           ::DiscourseQuizbook.system_log(
-            "🔎 **@#{user.username}** ran lookup on `#{target}` in topic ##{topic.id}"
+            "🔎 **@#{user.username}** ran `lookup #{target}` in topic ##{topic.id}"
+          )
+          next
+
+        when "help"
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw:
+              "**Support bot commands**\n\n" \
+              "_Inside the Support Tickets category:_\n" \
+              "- `@#{bot.username} respond [message]` — emails the ticket submitter\n" \
+              "- `@#{bot.username} internalnote [text]` — adds a staff-only note\n" \
+              "- `@#{bot.username} changestatus [open|pending|resolved|closed]`\n" \
+              "\n_Anywhere on the forum:_\n" \
+              "- `@#{bot.username} lookup [@user|email]` — combined Discourse + quiz-site card\n" \
+              "- `@#{bot.username} help` — this message",
+            skip_validations: true,
+          )
+          next
+
+        else
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw: "🤔 Unknown command `#{cmd}`. Try `@#{bot.username} help`.",
+            skip_validations: true,
           )
           next
         end
       end
+
     rescue StandardError => e
       Rails.logger.warn("[quizbook] post_created handler failed: #{e.class}: #{e.message}")
     end
