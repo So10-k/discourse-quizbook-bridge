@@ -18,3 +18,102 @@
 .qb-widget-qotd iframe { min-height: 280px; }
 .qb-widget-bracket iframe { min-height: 480px; }
 .qb-widget-standings iframe { min-height: 360px; }
+
+// ── Tournament-record stats card on /u/<name>/summary ───────────
+// Rendered by the user-summary-stats-bottom plugin connector. Shows
+// per-user lifetime tournament record from qb_* custom fields shipped
+// in the SSO payload.
+.qb-stats-card {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 3px solid #1B2A4E;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #FFFFFF 0%, #F4FAFF 100%);
+  box-shadow: 4px 4px 0 0 #1B2A4E;
+  font-family: "Quicksand", sans-serif;
+  color: #1B2A4E;
+
+  &__title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 8px;
+    h3 {
+      margin: 0;
+      font-family: "Fredoka", sans-serif;
+      font-size: 18px;
+      letter-spacing: 0.02em;
+    }
+  }
+  &__crown { font-size: 22px; }
+  &__rank {
+    display: inline-block;
+    margin-bottom: 10px;
+    padding: 4px 14px;
+    border: 2px solid #1B2A4E;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #FFD93D 0%, #E94B7E 100%);
+    color: #1B2A4E;
+    font-family: "Fredoka", sans-serif;
+    font-weight: 600;
+    font-size: 13px;
+    box-shadow: 2px 2px 0 0 #1B2A4E;
+  }
+  &__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(85px, 1fr));
+    gap: 8px;
+    margin: 12px 0;
+  }
+  &__status {
+    margin-top: 12px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 2px solid #1B2A4E;
+    font-family: "Fredoka", sans-serif;
+    font-weight: 600;
+    font-size: 13px;
+    display: inline-block;
+    &--in { background: #4FB04F; color: #FFFFFF; }
+    &--out { background: #C9296A; color: #FFFFFF; }
+    &--spectator { background: #B7E5FF; color: #1B2A4E; }
+  }
+  &__link {
+    display: inline-block;
+    margin-top: 12px;
+    margin-left: 8px;
+    padding: 4px 12px;
+    border: 2px solid #1B2A4E;
+    border-radius: 999px;
+    font-family: "Fredoka", sans-serif;
+    font-weight: 600;
+    font-size: 13px;
+    color: #1B2A4E !important;
+    background: #FFD93D;
+    text-decoration: none !important;
+    box-shadow: 2px 2px 0 0 #1B2A4E;
+    transition: transform 80ms;
+    &:hover { transform: translate(-1px, -1px); box-shadow: 3px 3px 0 0 #1B2A4E; }
+  }
+}
+.qb-stat {
+  text-align: center;
+  padding: 8px 4px;
+  border: 2px solid #1B2A4E;
+  border-radius: 12px;
+  background: #FFFFFF;
+  &__num {
+    font-family: "Fredoka", sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #1B2A4E;
+    line-height: 1;
+  }
+  &__label {
+    margin-top: 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #3B4A7E;
+  }
+}

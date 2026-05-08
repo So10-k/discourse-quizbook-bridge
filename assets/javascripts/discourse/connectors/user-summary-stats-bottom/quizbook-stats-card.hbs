@@ -1,0 +1,67 @@
+{{!--
+  Renders below the existing user-summary stats grid on
+  /u/<name>/summary. Uses the qb_* custom fields shipped by
+  the quiz-site SSO flow into User#custom_fields, surfaced via
+  the user serializer addition in plugin.rb.
+
+  All data is per-user and rendered server-side from the
+  UserSerializer payload — no extra fetches.
+--}}
+{{#if this.model.quizbook_stats}}
+  <div class="qb-stats-card">
+    <div class="qb-stats-card__title">
+      <span class="qb-stats-card__crown">📚</span>
+      <h3>Tournament record</h3>
+    </div>
+
+    {{#if this.model.quizbook_stats.rank_title}}
+      <div class="qb-stats-card__rank">
+        {{this.model.quizbook_stats.rank_title}}
+      </div>
+    {{/if}}
+
+    <div class="qb-stats-card__grid">
+      <div class="qb-stat">
+        <div class="qb-stat__num">{{or this.model.quizbook_stats.total_wins "0"}}</div>
+        <div class="qb-stat__label">match wins</div>
+      </div>
+      <div class="qb-stat">
+        <div class="qb-stat__num">{{or this.model.quizbook_stats.total_matches "0"}}</div>
+        <div class="qb-stat__label">matches</div>
+      </div>
+      <div class="qb-stat">
+        <div class="qb-stat__num">{{or this.model.quizbook_stats.championships "0"}}</div>
+        <div class="qb-stat__label">titles</div>
+      </div>
+      <div class="qb-stat">
+        <div class="qb-stat__num">{{or this.model.quizbook_stats.prediction_count "0"}}</div>
+        <div class="qb-stat__label">predictions</div>
+      </div>
+      <div class="qb-stat">
+        <div class="qb-stat__num">{{or this.model.quizbook_stats.qotd_answers "0"}}</div>
+        <div class="qb-stat__label">QOTD answers</div>
+      </div>
+      {{#if this.model.quizbook_stats.furthest_round}}
+        <div class="qb-stat">
+          <div class="qb-stat__num">R{{this.model.quizbook_stats.furthest_round}}</div>
+          <div class="qb-stat__label">furthest round</div>
+        </div>
+      {{/if}}
+    </div>
+
+    {{#if (eq this.model.quizbook_stats.current_status "still_in")}}
+      <div class="qb-stats-card__status qb-stats-card__status--in">⚔️ Still in this season</div>
+    {{else if (eq this.model.quizbook_stats.current_status "eliminated")}}
+      <div class="qb-stats-card__status qb-stats-card__status--out">
+        💀 Eliminated{{#if this.model.quizbook_stats.eliminated_in_round}}
+          in chapter {{this.model.quizbook_stats.eliminated_in_round}}{{/if}}
+      </div>
+    {{else}}
+      <div class="qb-stats-card__status qb-stats-card__status--spectator">👀 Spectator this season</div>
+    {{/if}}
+
+    <a class="qb-stats-card__link" href="https://quiz.miaswebsites.art/standings">
+      📈 See full standings
+    </a>
+  </div>
+{{/if}}
