@@ -386,48 +386,68 @@ after_initialize do
     end
   end
 
-  # Helper: pull the `Held Reviews` category. Tagged via the
-  # CATEGORY_FIELD_IS_HELD_REVIEWS custom field by the seed script
-  # so we don't depend on the slug staying constant.
-  def self.find_held_reviews_category
-    Category
-      .joins(
-        "LEFT JOIN category_custom_fields ccf ON ccf.category_id = categories.id"
-      )
-      .where(
-        "ccf.name = ? AND ccf.value = ?",
-        ::DiscourseQuizbook::CATEGORY_FIELD_IS_HELD_REVIEWS,
-        "true"
-      )
-      .first || Category.find_by(slug: "held-reviews")
-  end
-
-  # Helper: append a single reply to the rolling System Activity Log
-  # topic in the System Logs category. Silently no-ops if the seed
-  # script hasn't run yet. Always invoked with skip_validations so
-  # bot floods don't trip rate limits.
-  def self.system_log(message)
-    return if message.to_s.strip.empty?
-    topic =
-      Topic
+  # Helpers live on the ::DiscourseQuizbook module itself. The
+  # surrounding `def self.X` syntax doesn't work here because inside
+  # the `after_initialize do ... end` block, `self` is the Plugin
+  # instance, not the module — so the methods would silently land
+  # on the plugin and fail when called as DiscourseQuizbook.X.
+  module ::DiscourseQuizbook
+    # Pull the `Held Reviews` category. Tagged via
+    # CATEGORY_FIELD_IS_HELD_REVIEWS by the seed script so we don't
+    # depend on the slug staying constant.
+    def self.find_held_reviews_category
+      Category
         .joins(
-          "LEFT JOIN topic_custom_fields tcf ON tcf.topic_id = topics.id"
+          "LEFT JOIN category_custom_fields ccf ON ccf.category_id = categories.id"
         )
         .where(
-          "tcf.name = ? AND tcf.value = ?",
-          ::DiscourseQuizbook::TOPIC_FIELD_IS_SYSTEM_ACTIVITY_LOG,
-          "true"
+          "ccf.name = ? AND ccf.value IN (?, ?)",
+          CATEGORY_FIELD_IS_HELD_REVIEWS,
+          "true",
+          "t"
         )
-        .first
-    return unless topic
-    PostCreator.create!(
-      Discourse.system_user,
-      topic_id: topic.id,
-      raw: "🤖 #{Time.now.utc.iso8601} — #{message}",
-      skip_validations: true,
-    )
-  rescue StandardError => e
-    Rails.logger.warn("[quizbook] system_log failed: #{e.message}")
+        .first || Category.find_by(slug: "held-reviews")
+    end
+
+    # Append a single reply to the rolling System Activity Log topic.
+    # Silently no-ops if the seed hasn't run.
+    def self.system_log(message)
+      return if message.to_s.strip.empty?
+      topic =
+        Topic
+          .joins(
+            "LEFT JOIN topic_custom_fields tcf ON tcf.topic_id = topics.id"
+          )
+          .where(
+            "tcf.name = ? AND tcf.value IN (?, ?)",
+            TOPIC_FIELD_IS_SYSTEM_ACTIVITY_LOG,
+            "true",
+            "t"
+          )
+          .first
+      return unless topic
+      PostCreator.create!(
+        Discourse.system_user,
+        topic_id: topic.id,
+        raw: "🤖 #{Time.now.utc.iso8601} — #{message}",
+        skip_validations: true,
+      )
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] system_log failed: #{e.message}")
+    end
+
+    # Strip Markdown formatting (** ** for bold, _ _ for italic, ` `
+    # for code) so the admin command parser is robust to Discourse's
+    # composer auto-formatting. Without this, `hold @user reason`
+    # rendered as `**hold** @user **reason**` won't match the regex.
+    def self.strip_markdown(s)
+      s.to_s
+        .gsub(/`([^`]*)`/, '\1')   # `code`
+        .gsub(/\*+([^*]*)\*+/, '\1') # **bold** / *italic*
+        .gsub(/_+([^_]*)_+/, '\1')   # __bold__ / _italic_
+        .gsub(/<[^>]+>/, '')         # any leftover HTML
+        .strip
+    end
   end
 
   # Hook 2: post-created. Multiplexed across three flows:
@@ -475,13 +495,34 @@ after_initialize do
         next
       end
 
-      # (b) admin command in a PM with system_user
+      # (b) admin command in a PM with system_user. Strip Discourse's
+      # Markdown formatting before regex match so `**hold** @user`
+      # (auto-bolded by the composer) parses just like `hold @user`.
       if topic.archetype == Archetype.private_message &&
          user.admin? &&
-         topic.allowed_users.exists?(id: Discourse.system_user.id) &&
-         (m = raw.match(/\A\s*(hold|unhold)\s+@?(\S+)(?:\s+(.+))?/im))
+         topic.allowed_users.exists?(id: Discourse.system_user.id)
+        clean = ::DiscourseQuizbook.strip_markdown(raw)
+        m = clean.match(/\A\s*(hold|unhold)\s+@?([\w.\-]+)(?:\s+(.+))?/im)
+        unless m
+          # Friendly "I didn't understand" — only fires if the post
+          # is short enough that it looks like a command attempt.
+          # Avoids spamming on conversational messages.
+          if clean.length < 200 && clean.match?(/\A\s*(hold|unhold|release|silence)/i)
+            PostCreator.create!(
+              Discourse.system_user,
+              topic_id: topic.id,
+              raw:
+                "🤔 I didn't understand that. Try:\n" \
+                "- `hold @username reason here`\n" \
+                "- `unhold @username`\n" \
+                "(don't bold/italicize the command)",
+              skip_validations: true,
+            )
+          end
+          next
+        end
         cmd = m[1].downcase
-        target_username = m[2].sub(/[^\w.\-]/, "")
+        target_username = m[2]
         reason = (m[3] || "").strip
         target = User.find_by(username_lower: target_username.downcase)
         unless target
