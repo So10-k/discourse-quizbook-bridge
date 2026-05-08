@@ -270,9 +270,17 @@ after_initialize do
   #     user is gated and where to send them.
   module ::DiscourseQuizbook
     HOLDING_GROUP = "pending_terms"
+    REVIEW_GROUP = "held_for_review"
     USER_FIELD_TERMS_PM_TOPIC_ID = "qb_terms_pm_topic_id"
     USER_FIELD_TERMS_AGREED_AT = "qb_terms_agreed_at"
+    USER_FIELD_REVIEW_PM_TOPIC_ID = "qb_review_pm_topic_id"
+    USER_FIELD_REVIEW_AUDIT_TOPIC_ID = "qb_review_audit_topic_id"
+    USER_FIELD_REVIEW_REASON = "qb_review_reason"
     TOPIC_FIELD_IS_TERMS_PM = "qb_is_terms_pm"
+    TOPIC_FIELD_IS_REVIEW_PM = "qb_is_review_pm"
+    TOPIC_FIELD_IS_REVIEW_AUDIT = "qb_is_review_audit"
+    TOPIC_FIELD_REVIEW_TARGET_ID = "qb_review_target_user_id"
+    CATEGORY_FIELD_IS_HELD_REVIEWS = "qb_is_held_reviews"
 
     TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
     TERMS_PM_BODY = <<~MD.freeze
@@ -299,31 +307,36 @@ after_initialize do
   # Whitelist the new user/topic custom fields. Discourse silently
   # drops unknown CFs unless registered.
   begin
-    User.register_custom_field_type(
-      ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID,
-      :integer
-    )
-    User.register_custom_field_type(
-      ::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT,
-      :string
-    )
-    Topic.register_custom_field_type(
-      ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM,
-      :boolean
-    )
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID, :integer)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT, :string)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID, :integer)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID, :integer)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_REASON, :string)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM, :boolean)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM, :boolean)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT, :boolean)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID, :integer)
   rescue StandardError => e
     Rails.logger.warn("[quizbook] custom_field register failed: #{e.message}")
   end
 
   add_preloaded_topic_list_custom_field(::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM) rescue nil
+  add_preloaded_topic_list_custom_field(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM) rescue nil
 
   # Surface gate-state on the current_user serializer so the theme
-  # JS knows whether to redirect, and to where.
+  # JS knows whether to redirect, and to where. Held-for-review wins
+  # over pending-terms (more pressing).
   add_to_serializer(:current_user, :qb_is_pending_terms) do
     object.groups.exists?(name: ::DiscourseQuizbook::HOLDING_GROUP)
   end
   add_to_serializer(:current_user, :qb_terms_pm_topic_id) do
     object.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID]
+  end
+  add_to_serializer(:current_user, :qb_is_held_for_review) do
+    object.groups.exists?(name: ::DiscourseQuizbook::REVIEW_GROUP)
+  end
+  add_to_serializer(:current_user, :qb_review_pm_topic_id) do
+    object.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID]
   end
 
   # Hook 1: a new user account exists → drop them into the holding
@@ -364,47 +377,349 @@ after_initialize do
     end
   end
 
-  # Hook 2: a post is created → if it's a reply by the user inside
-  # their terms PM and the raw body contains "yes" as a word, drop
-  # the user from the holding group, mark them as agreed, and post
-  # a friendly confirmation.
+  # Helper: pull the `Held Reviews` category. Tagged via the
+  # CATEGORY_FIELD_IS_HELD_REVIEWS custom field by the seed script
+  # so we don't depend on the slug staying constant.
+  def self.find_held_reviews_category
+    cat_id = TopicCustomField rescue nil  # noop — type hint
+    Category
+      .joins(
+        "LEFT JOIN category_custom_fields ccf ON ccf.category_id = categories.id"
+      )
+      .where(
+        "ccf.name = ? AND ccf.value = ?",
+        ::DiscourseQuizbook::CATEGORY_FIELD_IS_HELD_REVIEWS,
+        "true"
+      )
+      .first || Category.find_by(slug: "held-reviews")
+  end
+
+  # Hook 2: post-created. Multiplexed across three flows:
+  #   (a) reply inside terms PM → release from pending_terms on "yes"
+  #   (b) admin command "hold @user reason" / "unhold @user" inside
+  #       a PM with system_user → admin hold/release flow
+  #   (c) reply inside a held user's review PM → file appeal in the
+  #       authors-only Held Reviews category
+  #   (d) admin reply yes/no in a Held Reviews audit topic → release
+  #       or deny the held user
   DiscourseEvent.on(:post_created) do |post, _opts, user|
     begin
       next if post.nil? || user.nil?
       next if user.id == Discourse.system_user.id
       topic = post.topic
       next unless topic
-      next unless topic.archetype == Archetype.private_message
-      next unless topic.custom_fields[
-        ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM
-      ]
-      # Word-boundary "yes" — case-insensitive. Doesn't match
-      # "yesterday" / "eyes" / etc. Also accepts "i agree" /
-      # "agreed" as an alternative phrasing.
       raw = post.raw.to_s
-      next unless raw =~ /\byes\b/i || raw =~ /\b(agree|agreed)\b/i
 
-      group = Group.find_by(name: ::DiscourseQuizbook::HOLDING_GROUP)
-      if group && group.users.exists?(id: user.id)
-        group.remove(user)
-        group.save!
+      # (a) terms PM agreement
+      if topic.archetype == Archetype.private_message &&
+         topic.custom_fields[::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM]
+        if raw =~ /\byes\b/i || raw =~ /\b(agree|agreed)\b/i
+          group = Group.find_by(name: ::DiscourseQuizbook::HOLDING_GROUP)
+          if group && group.users.exists?(id: user.id)
+            group.remove(user)
+            group.save!
+          end
+          user.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT] =
+            Time.now.utc.iso8601
+          user.save_custom_fields(true)
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw:
+              "🎉 You're in! Thanks for agreeing — you now have full access " \
+              "to the forum. Have fun, and check out the [tournament " \
+              "bracket](https://quiz.miaswebsites.art/standings) when you " \
+              "get a chance.",
+            skip_validations: true,
+          )
+        end
+        next
       end
-      user.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT] =
-        Time.now.utc.iso8601
-      user.save_custom_fields(true)
 
-      PostCreator.create!(
-        Discourse.system_user,
-        topic_id: topic.id,
-        raw:
-          "🎉 You're in! Thanks for agreeing — you now have full access " \
-          "to the forum. Have fun, and check out the [tournament " \
-          "bracket](https://quiz.miaswebsites.art/standings) when you " \
-          "get a chance.",
-        skip_validations: true,
-      )
+      # (b) admin command in a PM with system_user
+      if topic.archetype == Archetype.private_message &&
+         user.admin? &&
+         topic.allowed_users.exists?(id: Discourse.system_user.id) &&
+         (m = raw.match(/\A\s*(hold|unhold)\s+@?(\S+)(?:\s+(.+))?/im))
+        cmd = m[1].downcase
+        target_username = m[2].sub(/[^\w.\-]/, "")
+        reason = (m[3] || "").strip
+        target = User.find_by(username_lower: target_username.downcase)
+        unless target
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw: "❌ User `@#{target_username}` not found.",
+            skip_validations: true,
+          )
+          next
+        end
+        if target.id == user.id
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw: "❌ You can't hold yourself.",
+            skip_validations: true,
+          )
+          next
+        end
+
+        review_group = Group.find_by(name: ::DiscourseQuizbook::REVIEW_GROUP)
+        unless review_group
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw: "❌ `held_for_review` group missing — run seed-held-reviews.rb.",
+            skip_validations: true,
+          )
+          next
+        end
+
+        if cmd == "unhold"
+          if review_group.users.exists?(id: target.id)
+            review_group.remove(target)
+            review_group.save!
+          end
+          target.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_REASON] = nil
+          target.save_custom_fields(true)
+          # DM the target a release note.
+          begin
+            review_pm_id = target.custom_fields[
+              ::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID
+            ].to_i
+            if review_pm_id > 0
+              PostCreator.create!(
+                Discourse.system_user,
+                topic_id: review_pm_id,
+                raw: "✅ You've been released by an admin. Welcome back.",
+                skip_validations: true,
+              )
+            end
+          rescue
+          end
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw: "✅ Released `@#{target.username}` from review.",
+            skip_validations: true,
+          )
+          next
+        end
+
+        # cmd == "hold"
+        if review_group.users.exists?(id: target.id)
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw: "ℹ️ `@#{target.username}` is already held. Reason updated to: #{reason.empty? ? '_(unchanged)_' : reason}",
+            skip_validations: true,
+          )
+        else
+          review_group.add(target)
+          review_group.save!
+        end
+        target.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_REASON] =
+          reason.presence || "(no reason given)"
+        target.save_custom_fields(true)
+
+        # Send target an appeal-required PM (or update existing one).
+        appeal_pm_id =
+          target.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID].to_i
+        appeal_pm_topic =
+          appeal_pm_id > 0 ? Topic.find_by(id: appeal_pm_id) : nil
+
+        appeal_body = <<~MD.freeze
+          Hi @#{target.username},
+
+          You've been placed under review by **@#{user.username}**.
+
+          **Reason:**
+          > #{reason.presence || '(no reason given)'}
+
+          To appeal, **reply to this message** with an apology, explanation, or any context the admins should consider. Your reply will be sent to the admin team for review.
+
+          Once an admin votes to release you, you'll get a confirmation here and regain full access to the forum.
+
+          — The Quiz Book team
+        MD
+
+        if appeal_pm_topic.nil?
+          appeal = PostCreator.create!(
+            Discourse.system_user,
+            title: "🔒 You've been placed under review",
+            raw: appeal_body,
+            archetype: Archetype.private_message,
+            target_usernames: target.username,
+            skip_validations: true,
+          )
+          new_topic = appeal&.topic
+          if new_topic
+            new_topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM
+            ] = true
+            new_topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
+            ] = target.id
+            new_topic.save_custom_fields(true)
+            target.custom_fields[
+              ::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID
+            ] = new_topic.id
+            target.save_custom_fields(true)
+          end
+        else
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: appeal_pm_topic.id,
+            raw: appeal_body,
+            skip_validations: true,
+          )
+        end
+
+        PostCreator.create!(
+          Discourse.system_user,
+          topic_id: topic.id,
+          raw:
+            "✅ Held `@#{target.username}`. Sent them an appeal PM — " \
+            "their reply will land in the **Held Reviews** category for " \
+            "your yes/no vote.",
+          skip_validations: true,
+        )
+        next
+      end
+
+      # (c) held user's appeal in their review PM
+      if topic.archetype == Archetype.private_message &&
+         topic.custom_fields[::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM] &&
+         topic.custom_fields[
+           ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
+         ].to_i == user.id
+        cat = ::DiscourseQuizbook.find_held_reviews_category
+        unless cat
+          Rails.logger.warn(
+            "[quizbook] Held Reviews category missing — appeal not filed"
+          )
+          next
+        end
+        reason = user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_REVIEW_REASON
+        ].to_s
+        audit_topic_id = user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID
+        ].to_i
+
+        audit_body = <<~MD.freeze
+          ### Appeal from @#{user.username}
+
+          **Hold reason (set by admin):**
+          > #{reason.presence || '(none)'}
+
+          **Their appeal:**
+
+          #{post.raw}
+
+          ---
+
+          **Admins:** reply with `yes` to release `@#{user.username}` or `no` to deny (they can submit another appeal).
+        MD
+
+        if audit_topic_id > 0 && (existing = Topic.find_by(id: audit_topic_id))
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: existing.id,
+            raw: audit_body,
+            skip_validations: true,
+          )
+        else
+          audit = PostCreator.create!(
+            Discourse.system_user,
+            title: "Appeal: @#{user.username}",
+            raw: audit_body,
+            category: cat.id,
+            skip_validations: true,
+          )
+          audit_topic = audit&.topic
+          if audit_topic
+            audit_topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT
+            ] = true
+            audit_topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
+            ] = user.id
+            audit_topic.save_custom_fields(true)
+            user.custom_fields[
+              ::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID
+            ] = audit_topic.id
+            user.save_custom_fields(true)
+          end
+        end
+
+        # Friendly ack to the held user.
+        PostCreator.create!(
+          Discourse.system_user,
+          topic_id: topic.id,
+          raw:
+            "🙏 Thanks — your appeal has been filed with the admins. " \
+            "We'll let you know here as soon as they vote.",
+          skip_validations: true,
+        )
+        next
+      end
+
+      # (d) admin yes/no on an audit topic in Held Reviews
+      if topic.custom_fields[::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT] &&
+         user.admin?
+        target_id = topic.custom_fields[
+          ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
+        ].to_i
+        target = target_id > 0 ? User.find_by(id: target_id) : nil
+        next unless target
+
+        is_yes = !!(raw =~ /\b(yes|approve|approved|release|released)\b/i)
+        is_no  = !!(raw =~ /\b(no|deny|denied|reject|rejected)\b/i)
+        next unless is_yes || is_no
+        # If both happen to match (rare), prefer yes.
+        verdict = is_yes ? :yes : :no
+
+        review_pm_id = target.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID
+        ].to_i
+
+        if verdict == :yes
+          group = Group.find_by(name: ::DiscourseQuizbook::REVIEW_GROUP)
+          if group && group.users.exists?(id: target.id)
+            group.remove(target)
+            group.save!
+          end
+          target.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_REASON] = nil
+          target.save_custom_fields(true)
+          if review_pm_id > 0
+            PostCreator.create!(
+              Discourse.system_user,
+              topic_id: review_pm_id,
+              raw:
+                "🎉 Your appeal was approved by **@#{user.username}**. " \
+                "You're free to use the forum again — welcome back.",
+              skip_validations: true,
+            )
+          end
+          # Lock the audit topic so further yes/no don't keep firing.
+          topic.update!(closed: true)
+        else
+          if review_pm_id > 0
+            PostCreator.create!(
+              Discourse.system_user,
+              topic_id: review_pm_id,
+              raw:
+                "Your appeal was **denied** by an admin. You can reply " \
+                "again here to submit another appeal when you're ready.",
+              skip_validations: true,
+            )
+          end
+        end
+        next
+      end
     rescue StandardError => e
-      Rails.logger.warn("[quizbook] terms agreement handler failed: #{e.message}")
+      Rails.logger.warn("[quizbook] post_created handler failed: #{e.class}: #{e.message}")
     end
   end
 end
