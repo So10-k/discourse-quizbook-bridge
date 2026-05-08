@@ -281,6 +281,8 @@ after_initialize do
     TOPIC_FIELD_IS_REVIEW_AUDIT = "qb_is_review_audit"
     TOPIC_FIELD_REVIEW_TARGET_ID = "qb_review_target_user_id"
     CATEGORY_FIELD_IS_HELD_REVIEWS = "qb_is_held_reviews"
+    CATEGORY_FIELD_IS_SYSTEM_LOGS = "qb_is_system_logs"
+    TOPIC_FIELD_IS_SYSTEM_ACTIVITY_LOG = "qb_is_system_activity_log"
 
     TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
     TERMS_PM_BODY = <<~MD.freeze
@@ -371,6 +373,9 @@ after_initialize do
           ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID
         ] = topic.id
         user.save_custom_fields(true)
+        ::DiscourseQuizbook.system_log(
+          "👋 New user **@#{user.username}** — added to `pending_terms`, sent terms PM (topic ##{topic.id})"
+        )
       end
     rescue StandardError => e
       Rails.logger.warn("[quizbook] terms PM creation failed: #{e.message}")
@@ -381,7 +386,6 @@ after_initialize do
   # CATEGORY_FIELD_IS_HELD_REVIEWS custom field by the seed script
   # so we don't depend on the slug staying constant.
   def self.find_held_reviews_category
-    cat_id = TopicCustomField rescue nil  # noop — type hint
     Category
       .joins(
         "LEFT JOIN category_custom_fields ccf ON ccf.category_id = categories.id"
@@ -392,6 +396,34 @@ after_initialize do
         "true"
       )
       .first || Category.find_by(slug: "held-reviews")
+  end
+
+  # Helper: append a single reply to the rolling System Activity Log
+  # topic in the System Logs category. Silently no-ops if the seed
+  # script hasn't run yet. Always invoked with skip_validations so
+  # bot floods don't trip rate limits.
+  def self.system_log(message)
+    return if message.to_s.strip.empty?
+    topic =
+      Topic
+        .joins(
+          "LEFT JOIN topic_custom_fields tcf ON tcf.topic_id = topics.id"
+        )
+        .where(
+          "tcf.name = ? AND tcf.value = ?",
+          ::DiscourseQuizbook::TOPIC_FIELD_IS_SYSTEM_ACTIVITY_LOG,
+          "true"
+        )
+        .first
+    return unless topic
+    PostCreator.create!(
+      Discourse.system_user,
+      topic_id: topic.id,
+      raw: "🤖 #{Time.now.utc.iso8601} — #{message}",
+      skip_validations: true,
+    )
+  rescue StandardError => e
+    Rails.logger.warn("[quizbook] system_log failed: #{e.message}")
   end
 
   # Hook 2: post-created. Multiplexed across three flows:
@@ -431,6 +463,9 @@ after_initialize do
               "bracket](https://quiz.miaswebsites.art/standings) when you " \
               "get a chance.",
             skip_validations: true,
+          )
+          ::DiscourseQuizbook.system_log(
+            "✅ **@#{user.username}** agreed to terms — removed from `pending_terms`"
           )
         end
         next
@@ -502,6 +537,9 @@ after_initialize do
             topic_id: topic.id,
             raw: "✅ Released `@#{target.username}` from review.",
             skip_validations: true,
+          )
+          ::DiscourseQuizbook.system_log(
+            "✅ **@#{user.username}** ran `unhold` on **@#{target.username}** — released immediately"
           )
           next
         end
@@ -584,6 +622,9 @@ after_initialize do
             "your yes/no vote.",
           skip_validations: true,
         )
+        ::DiscourseQuizbook.system_log(
+          "🔒 **@#{user.username}** held **@#{target.username}** — reason: _#{reason.presence || '(none)'}_"
+        )
         next
       end
 
@@ -662,6 +703,12 @@ after_initialize do
             "We'll let you know here as soon as they vote.",
           skip_validations: true,
         )
+        audit_id = user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID
+        ].to_i
+        ::DiscourseQuizbook.system_log(
+          "📝 **@#{user.username}** filed appeal — audit topic ##{audit_id} in **Held Reviews**"
+        )
         next
       end
 
@@ -704,6 +751,9 @@ after_initialize do
           end
           # Lock the audit topic so further yes/no don't keep firing.
           topic.update!(closed: true)
+          ::DiscourseQuizbook.system_log(
+            "✅ **@#{user.username}** approved appeal of **@#{target.username}** — released"
+          )
         else
           if review_pm_id > 0
             PostCreator.create!(
@@ -715,6 +765,9 @@ after_initialize do
               skip_validations: true,
             )
           end
+          ::DiscourseQuizbook.system_log(
+            "❌ **@#{user.username}** denied appeal of **@#{target.username}** — still held"
+          )
         end
         next
       end
