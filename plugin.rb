@@ -1181,33 +1181,29 @@ after_initialize do
         when "lookup"
           target = body_arg.split(/\s+/).first.to_s
           if target.empty?
-            PostCreator.create!(
-              bot,
-              topic_id: topic.id,
-              raw: "🤔 Usage: `@#{bot.username} lookup @username` or `@#{bot.username} lookup email@example.com`",
-              skip_validations: true,
-            )
+            begin
+              PostCreator.create!(
+                bot,
+                topic_id: topic.id,
+                raw: "🤔 Usage: `@#{bot.username} lookup @username` or `@#{bot.username} lookup email@example.com`",
+                post_type: Post.types[:whisper],
+                skip_validations: true,
+              )
+            rescue StandardError
+            end
             next
           end
           card = ::DiscourseQuizbook.build_lookup_card(target)
-          # Whisper if possible (staff-only); fall back to a regular
-          # post so non-whisper-enabled installs still see the card.
-          begin
-            PostCreator.create!(
-              Discourse.system_user,
-              topic_id: topic.id,
-              raw: card,
-              post_type: Post.types[:whisper],
-              skip_validations: true,
-            )
-          rescue StandardError
-            PostCreator.create!(
-              Discourse.system_user,
-              topic_id: topic.id,
-              raw: card,
-              skip_validations: true,
-            )
-          end
+          # Regular post (not whisper) so non-mod authors can read it.
+          # Posted by the bot, not system, so it shows up under the
+          # bot's identity. Authors typically run lookup in author-
+          # only categories or PMs where leak risk is bounded.
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw: card,
+            skip_validations: true,
+          )
           ::DiscourseQuizbook.system_log(
             "🔎 **@#{user.username}** ran `lookup #{target}` in topic ##{topic.id}"
           )
