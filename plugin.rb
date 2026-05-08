@@ -255,4 +255,156 @@ after_initialize do
   register_html_builder("server:before-head-close-crawler") do
     %(<meta name="quizbook-bridge" content="enabled" />)
   end
+
+  # ── terms-agreement holding zone ───────────────────────────────
+  # First-time SSO users land in the `pending_terms` group, get a
+  # system PM with the terms, and the theme JS redirects every page
+  # to that PM until they reply with "yes" to escape the group.
+  #
+  # The seeded group is `pending_terms` (see
+  # discourse/seed/seed-terms-gate.rb). Plugin code below handles:
+  #   - on user_created → add to group + send PM + remember PM topic id
+  #   - on post_created → if it's a reply in the user's terms PM and
+  #     the body contains "yes", remove from group + post confirmation
+  #   - serializer additions so the theme JS can know if the current
+  #     user is gated and where to send them.
+  module ::DiscourseQuizbook
+    HOLDING_GROUP = "pending_terms"
+    USER_FIELD_TERMS_PM_TOPIC_ID = "qb_terms_pm_topic_id"
+    USER_FIELD_TERMS_AGREED_AT = "qb_terms_agreed_at"
+    TOPIC_FIELD_IS_TERMS_PM = "qb_is_terms_pm"
+
+    TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
+    TERMS_PM_BODY = <<~MD.freeze
+      Hi there, and welcome to **Mia's Quiz Discuss**! 🌞
+
+      Before you can use the rest of the forum, please take a moment to agree to a few simple things:
+
+      ### 📜 The Quick Terms
+      1. **Be kind.** This is a family-friendly tournament forum.
+      2. **No spam, no ads, no off-topic links.**
+      3. **Mia and Sam (the authors) have final say on disputes.**
+      4. Your tournament status (player, finalist, alumnus, etc.) syncs automatically from the main site — flair updates on every login.
+
+      ---
+
+      To accept these terms and unlock the full forum, **reply to this message with "yes"**.
+
+      _If you have any questions, just reply here — we'll see it._
+
+      — The Quiz Book team
+    MD
+  end
+
+  # Whitelist the new user/topic custom fields. Discourse silently
+  # drops unknown CFs unless registered.
+  begin
+    User.register_custom_field_type(
+      ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID,
+      :integer
+    )
+    User.register_custom_field_type(
+      ::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT,
+      :string
+    )
+    Topic.register_custom_field_type(
+      ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM,
+      :boolean
+    )
+  rescue StandardError => e
+    Rails.logger.warn("[quizbook] custom_field register failed: #{e.message}")
+  end
+
+  add_preloaded_topic_list_custom_field(::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM) rescue nil
+
+  # Surface gate-state on the current_user serializer so the theme
+  # JS knows whether to redirect, and to where.
+  add_to_serializer(:current_user, :qb_is_pending_terms) do
+    object.groups.exists?(name: ::DiscourseQuizbook::HOLDING_GROUP)
+  end
+  add_to_serializer(:current_user, :qb_terms_pm_topic_id) do
+    object.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID]
+  end
+
+  # Hook 1: a new user account exists → drop them into the holding
+  # group, fire a PM, remember the topic id on their custom_fields
+  # so the theme JS can redirect there.
+  DiscourseEvent.on(:user_created) do |user|
+    next if user.nil?
+    next if user.staged
+    next if user.username == Discourse.system_user.username
+    begin
+      group = Group.find_by(name: ::DiscourseQuizbook::HOLDING_GROUP)
+      if group && !group.users.exists?(id: user.id)
+        group.add(user)
+        group.save!
+      end
+
+      result = PostCreator.create!(
+        Discourse.system_user,
+        title: ::DiscourseQuizbook::TERMS_PM_TITLE,
+        raw: ::DiscourseQuizbook::TERMS_PM_BODY,
+        archetype: Archetype.private_message,
+        target_usernames: user.username,
+        skip_validations: true,
+      )
+      topic = result&.topic
+      if topic
+        topic.custom_fields[
+          ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM
+        ] = true
+        topic.save_custom_fields(true)
+        user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID
+        ] = topic.id
+        user.save_custom_fields(true)
+      end
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] terms PM creation failed: #{e.message}")
+    end
+  end
+
+  # Hook 2: a post is created → if it's a reply by the user inside
+  # their terms PM and the raw body contains "yes" as a word, drop
+  # the user from the holding group, mark them as agreed, and post
+  # a friendly confirmation.
+  DiscourseEvent.on(:post_created) do |post, _opts, user|
+    begin
+      next if post.nil? || user.nil?
+      next if user.id == Discourse.system_user.id
+      topic = post.topic
+      next unless topic
+      next unless topic.archetype == Archetype.private_message
+      next unless topic.custom_fields[
+        ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM
+      ]
+      # Word-boundary "yes" — case-insensitive. Doesn't match
+      # "yesterday" / "eyes" / etc. Also accepts "i agree" /
+      # "agreed" as an alternative phrasing.
+      raw = post.raw.to_s
+      next unless raw =~ /\byes\b/i || raw =~ /\b(agree|agreed)\b/i
+
+      group = Group.find_by(name: ::DiscourseQuizbook::HOLDING_GROUP)
+      if group && group.users.exists?(id: user.id)
+        group.remove(user)
+        group.save!
+      end
+      user.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT] =
+        Time.now.utc.iso8601
+      user.save_custom_fields(true)
+
+      PostCreator.create!(
+        Discourse.system_user,
+        topic_id: topic.id,
+        raw:
+          "🎉 You're in! Thanks for agreeing — you now have full access " \
+          "to the forum. Have fun, and check out the [tournament " \
+          "bracket](https://quiz.miaswebsites.art/standings) when you " \
+          "get a chance.",
+        skip_validations: true,
+      )
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] terms agreement handler failed: #{e.message}")
+    end
+  end
 end
