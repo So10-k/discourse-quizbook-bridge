@@ -283,6 +283,13 @@ after_initialize do
     CATEGORY_FIELD_IS_HELD_REVIEWS = "qb_is_held_reviews"
     CATEGORY_FIELD_IS_SYSTEM_LOGS = "qb_is_system_logs"
     TOPIC_FIELD_IS_SYSTEM_ACTIVITY_LOG = "qb_is_system_activity_log"
+    CATEGORY_FIELD_IS_SUPPORT_TICKETS = "qb_is_support_tickets"
+    TOPIC_FIELD_IS_SUPPORT_TICKET = "qb_is_support_ticket"
+    TOPIC_FIELD_TICKET_STATUS = "qb_ticket_status"
+    TOPIC_FIELD_TICKET_EMAIL = "qb_ticket_email"
+    TOPIC_FIELD_TICKET_NAME = "qb_ticket_name"
+    SUPPORT_BOT_USERNAME = "support_bot"
+    TICKET_STATUSES = %w[open pending resolved closed].freeze
 
     TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
     TERMS_PM_BODY = <<~MD.freeze
@@ -434,6 +441,61 @@ after_initialize do
       )
     rescue StandardError => e
       Rails.logger.warn("[quizbook] system_log failed: #{e.message}")
+    end
+
+    # Pull the Support Tickets category, tagged via
+    # CATEGORY_FIELD_IS_SUPPORT_TICKETS by the seed script.
+    def self.find_support_tickets_category
+      Category
+        .joins(
+          "LEFT JOIN category_custom_fields ccf ON ccf.category_id = categories.id"
+        )
+        .where(
+          "ccf.name = ? AND ccf.value IN (?, ?)",
+          CATEGORY_FIELD_IS_SUPPORT_TICKETS,
+          "true",
+          "t"
+        )
+        .first || Category.find_by(slug: "support-tickets")
+    end
+
+    def self.support_bot_user
+      User.find_by(username_lower: SUPPORT_BOT_USERNAME)
+    end
+
+    # Forward a "respond" command to the quiz site so it can email
+    # the original ticket submitter. Failures log and continue —
+    # the admin's command still posts a reply in Discourse so they
+    # see what they sent.
+    def self.notify_quiz_site_of_response(topic, message)
+      uri =
+        URI.parse(
+          "#{::DiscourseQuizbook::QUIZ_BASE}/api/support/respond"
+        )
+      payload = {
+        topic_id: topic.id,
+        recipient_email: topic.custom_fields[TOPIC_FIELD_TICKET_EMAIL].to_s,
+        recipient_name: topic.custom_fields[TOPIC_FIELD_TICKET_NAME].to_s,
+        subject: topic.title,
+        message: message,
+      }
+      body = payload.to_json
+      secret = SiteSetting.discourse_connect_secret
+      sig = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, body)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == "https")
+      http.open_timeout = 5
+      http.read_timeout = 8
+      req = Net::HTTP::Post.new(uri.path)
+      req["Content-Type"] = "application/json"
+      req["X-Quizbook-Signature"] = sig
+      req.body = body
+      res = http.request(req)
+      Rails.logger.info("[quizbook] support respond → #{res.code}")
+      res
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] support respond callback failed: #{e.message}")
+      nil
     end
 
     # Strip Markdown formatting (** ** for bold, _ _ for italic, ` `
@@ -815,6 +877,159 @@ after_initialize do
           )
         end
         next
+      end
+
+      # (e) @support_bot commands inside the Support Tickets category.
+      # Only fires when the post is in a topic flagged as a support
+      # ticket AND the actor is an admin/author. The bot ignores
+      # commands anywhere else (so admins can't accidentally trigger
+      # bot actions outside the ticket area).
+      support_cat = ::DiscourseQuizbook.find_support_tickets_category
+      bot = ::DiscourseQuizbook.support_bot_user
+      if topic.category_id && support_cat && bot &&
+         topic.category_id == support_cat.id &&
+         (user.admin? || user.groups.exists?(name: "authors"))
+        clean = ::DiscourseQuizbook.strip_markdown(raw)
+        # Match: @support_bot <command> <rest>
+        cmd_match = clean.match(/@#{Regexp.escape(bot.username)}\s+(\w+)\s*(.*)/im)
+        next unless cmd_match
+        cmd = cmd_match[1].downcase
+        body_arg = cmd_match[2].strip
+
+        case cmd
+        when "respond", "reply"
+          if body_arg.empty?
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: "🤔 Usage: `@support_bot respond [message to send to the user]`",
+              skip_validations: true,
+            )
+            next
+          end
+          # 1. Bot acknowledges in the topic with the message it
+          # will email. Visible to admins + (if needed) reviewable.
+          formatted = <<~MD
+            📨 **Response sent to ticket submitter**
+
+            > #{body_arg.lines.map(&:chomp).join("\n> ")}
+
+            _Sent by @#{user.username} · #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}_
+          MD
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw: formatted,
+            skip_validations: true,
+          )
+          # 2. Tell the quiz site to actually email the recipient.
+          ::DiscourseQuizbook.notify_quiz_site_of_response(topic, body_arg)
+          # 3. Update status to pending if currently open.
+          if topic.custom_fields[TOPIC_FIELD_TICKET_STATUS].to_s == "open"
+            topic.custom_fields[TOPIC_FIELD_TICKET_STATUS] = "pending"
+            topic.save_custom_fields(true)
+          end
+          ::DiscourseQuizbook.system_log(
+            "📨 **@#{user.username}** responded on ticket ##{topic.id}"
+          )
+          next
+
+        when "internalnote", "note", "internal"
+          if body_arg.empty?
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: "🤔 Usage: `@support_bot internalnote [staff-only note]`",
+              skip_validations: true,
+            )
+            next
+          end
+          formatted = <<~MD
+            🔒 **Internal note** _(not visible to ticket submitter)_
+
+            #{body_arg}
+
+            _by @#{user.username} · #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}_
+          MD
+          # post_type 4 = whisper (staff-only). Falls back to a
+          # styled regular post if whispers are disabled.
+          begin
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: formatted,
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: formatted,
+              skip_validations: true,
+            )
+          end
+          ::DiscourseQuizbook.system_log(
+            "🔒 **@#{user.username}** added internal note on ticket ##{topic.id}"
+          )
+          next
+
+        when "changestatus", "status", "setstatus"
+          new_status = body_arg.split(/\s+/).first.to_s.downcase
+          unless TICKET_STATUSES.include?(new_status)
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: "🤔 Status must be one of: #{TICKET_STATUSES.join(', ')}.",
+              skip_validations: true,
+            )
+            next
+          end
+          old_status = topic.custom_fields[TOPIC_FIELD_TICKET_STATUS].to_s
+          topic.custom_fields[TOPIC_FIELD_TICKET_STATUS] = new_status
+          topic.save_custom_fields(true)
+          # Close the topic if status is "resolved" or "closed".
+          if %w[resolved closed].include?(new_status) && !topic.closed
+            topic.update!(closed: true)
+          elsif %w[open pending].include?(new_status) && topic.closed
+            topic.update!(closed: false)
+          end
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw:
+              "🔁 Status: **#{old_status.empty? ? '(unset)' : old_status}** → **#{new_status}** " \
+              "(by @#{user.username})",
+            skip_validations: true,
+          )
+          ::DiscourseQuizbook.system_log(
+            "🔁 **@#{user.username}** changed ticket ##{topic.id} status: #{old_status} → #{new_status}"
+          )
+          next
+
+        when "help"
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw:
+              "**Support bot commands** (use inside this category only):\n\n" \
+              "- `@support_bot respond [message]` — emails the submitter\n" \
+              "- `@support_bot internalnote [text]` — adds a staff-only note\n" \
+              "- `@support_bot changestatus [open|pending|resolved|closed]`\n" \
+              "- `@support_bot help` — this message",
+            skip_validations: true,
+          )
+          next
+
+        else
+          PostCreator.create!(
+            bot,
+            topic_id: topic.id,
+            raw: "🤔 Unknown command `#{cmd}`. Try `@support_bot help`.",
+            skip_validations: true,
+          )
+          next
+        end
       end
     rescue StandardError => e
       Rails.logger.warn("[quizbook] post_created handler failed: #{e.class}: #{e.message}")
