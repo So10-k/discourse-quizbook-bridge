@@ -463,22 +463,11 @@ after_initialize do
       User.find_by(username_lower: SUPPORT_BOT_USERNAME)
     end
 
-    # Forward a "respond" command to the quiz site so it can email
-    # the original ticket submitter. Failures log and continue —
-    # the admin's command still posts a reply in Discourse so they
-    # see what they sent.
-    def self.notify_quiz_site_of_response(topic, message)
-      uri =
-        URI.parse(
-          "#{::DiscourseQuizbook::QUIZ_BASE}/api/support/respond"
-        )
-      payload = {
-        topic_id: topic.id,
-        recipient_email: topic.custom_fields[TOPIC_FIELD_TICKET_EMAIL].to_s,
-        recipient_name: topic.custom_fields[TOPIC_FIELD_TICKET_NAME].to_s,
-        subject: topic.title,
-        message: message,
-      }
+    # Generic HMAC-signed POST to the quiz site. Used by all the
+    # plugin → quiz-site callbacks (response email, status sync,
+    # user lookup). Returns the parsed JSON body, or nil on error.
+    def self.quiz_site_post(path, payload)
+      uri = URI.parse("#{::DiscourseQuizbook::QUIZ_BASE}#{path}")
       body = payload.to_json
       secret = SiteSetting.discourse_connect_secret
       sig = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, body)
@@ -491,11 +480,145 @@ after_initialize do
       req["X-Quizbook-Signature"] = sig
       req.body = body
       res = http.request(req)
-      Rails.logger.info("[quizbook] support respond → #{res.code}")
-      res
+      Rails.logger.info("[quizbook] POST #{path} → #{res.code}")
+      return nil unless res.code.to_i == 200
+      JSON.parse(res.body)
     rescue StandardError => e
-      Rails.logger.warn("[quizbook] support respond callback failed: #{e.message}")
+      Rails.logger.warn("[quizbook] POST #{path} failed: #{e.message}")
       nil
+    end
+
+    # Email the original ticket submitter via the quiz site's
+    # email-provider abstraction (which routes through Brevo or
+    # Resend, never via Discourse's SMTP).
+    def self.notify_quiz_site_of_response(topic, message)
+      quiz_site_post("/api/support/respond", {
+        topic_id: topic.id,
+        recipient_email: topic.custom_fields[TOPIC_FIELD_TICKET_EMAIL].to_s,
+        recipient_name: topic.custom_fields[TOPIC_FIELD_TICKET_NAME].to_s,
+        subject: topic.title,
+        message: message,
+      })
+    end
+
+    # Sync a status change to the quiz site so the local ticket row
+    # mirrors what's in Discourse.
+    def self.sync_ticket_status(topic_id, status)
+      quiz_site_post("/api/support/sync-status", {
+        topic_id: topic_id,
+        status: status,
+      })
+    end
+
+    # Fetch a quiz-site user's profile + tournament info by email or
+    # external_id. Returns the parsed JSON or nil.
+    def self.lookup_quiz_user(identifier)
+      quiz_site_post("/api/forum/lookup", { identifier: identifier })
+    end
+
+    # Build the Markdown body of a lookup card. `target` is either a
+    # username (with optional @) or a raw email. Combines Discourse
+    # data + quiz-site data via lookup_quiz_user.
+    def self.build_lookup_card(target)
+      target_clean = target.to_s.strip.sub(/\A@/, "")
+      is_email = target_clean.include?("@")
+
+      # Discourse-side: try to find a User by username first, then
+      # fall back to email if it looks like one.
+      duser =
+        if is_email
+          User.with_email(target_clean.downcase).first
+        else
+          User.find_by(username_lower: target_clean.downcase)
+        end
+
+      identifier_for_quiz =
+        if duser
+          ssr = SingleSignOnRecord.find_by(user_id: duser.id)
+          ssr&.external_id || duser.email
+        else
+          target_clean
+        end
+      quiz = lookup_quiz_user(identifier_for_quiz) || {}
+
+      lines = []
+      lines << "## 🔎 Lookup: `#{target_clean}`"
+      lines << ""
+
+      # Discourse section
+      lines << "### Forum"
+      if duser
+        groups = duser.groups.where(automatic: false).pluck(:name).join(", ")
+        groups = "(none)" if groups.empty?
+        susp = duser.suspended? ? "🚫 SUSPENDED until #{duser.suspended_till}" : nil
+        sil = duser.silenced? ? "🤐 silenced until #{duser.silenced_till}" : nil
+        lines << "- **@#{duser.username}** · admin=#{duser.admin} · mod=#{duser.moderator}"
+        lines << "- TL: #{duser.trust_level} · last seen: #{duser.last_seen_at || '(never)'}"
+        lines << "- groups: #{groups}"
+        lines << "- posts: #{duser.post_count} · topics: #{duser.topic_count}"
+        lines << "- email: #{duser.email}"
+        lines << "- #{susp}" if susp
+        lines << "- #{sil}" if sil
+
+        # Recent UserHistory (staff actions targeting this user)
+        history =
+          UserHistory.where(target_user_id: duser.id)
+            .order(created_at: :desc).limit(5)
+        if history.any?
+          lines << ""
+          lines << "**Recent staff actions:**"
+          history.each do |h|
+            actor_name =
+              h.acting_user_id ? "@#{User.find_by(id: h.acting_user_id)&.username || '?'}" : "system"
+            action_label =
+              h.custom_type.presence ||
+              UserHistory.actions.invert[h.action]&.to_s ||
+              "(unknown)"
+            lines << "- `#{h.created_at.strftime('%Y-%m-%d %H:%M')}` #{actor_name} → **#{action_label}** #{h.details.to_s.lines.first}"
+          end
+        end
+      else
+        lines << "- (no Discourse user found for `#{target_clean}`)"
+      end
+
+      lines << ""
+      lines << "### Quiz site"
+      if quiz["found"]
+        p = quiz["profile"] || {}
+        t = quiz["tournament"] || {}
+        v = quiz["last_visit"] || {}
+        forum = quiz["forum"] || {}
+        lines << "- **#{p['name'] || '(no name)'}** · `#{p['email']}` · role=#{p['role']}"
+        lines << "- quiz id: `#{p['id']}` · joined: #{(p['created_at'] || '').to_s[0,10]}"
+        if t.is_a?(Hash) && !t.empty?
+          lines << "- tournament: #{t['rank_title']} (`#{t['rank_group']}`)"
+          lines << "- record: #{t['total_wins']}/#{t['total_matches']} matches · #{t['championships']}× champion"
+          lines << "- furthest round: #{t['furthest_round'] || '—'} · status: #{t['status']}"
+          lines << "- engagement: #{t['prediction_count']} predictions · #{t['qotd_answers']} QOTD"
+        end
+        if forum.is_a?(Hash) && !(forum["manual_grants"] || []).empty?
+          lines << "- manual forum grants: #{(forum['manual_grants'] || []).join(', ')}"
+        end
+        if v.is_a?(Hash) && !v.empty?
+          where = [v['city'], v['region'], v['country']].compact.reject(&:empty?).join(", ")
+          ip_note = v['ip_blocked'] ? " · 🚫 IP IS BLOCKED" : ""
+          lines << "- last visit: #{(v['at'] || '').to_s[0,16]} from #{where} (`#{v['ip']}`)#{ip_note}"
+        end
+        tickets = quiz["recent_tickets"] || []
+        if tickets.any?
+          lines << ""
+          lines << "**Recent support tickets:**"
+          tickets.each do |t|
+            lines << "- ##{t['topic_id']} `#{t['status']}` — #{t['subject']}"
+          end
+        end
+      else
+        lines << "- (no quiz-site account found for `#{identifier_for_quiz}`)"
+      end
+
+      lines << ""
+      lines << "_Visible only to staff. Run `@lookup @<user>` in any topic to refresh._"
+      lines.join("\n")
     end
 
     # Strip Markdown formatting (** ** for bold, _ _ for italic, ` `
@@ -988,6 +1111,7 @@ after_initialize do
           old_status = topic.custom_fields[TOPIC_FIELD_TICKET_STATUS].to_s
           topic.custom_fields[TOPIC_FIELD_TICKET_STATUS] = new_status
           topic.save_custom_fields(true)
+          ::DiscourseQuizbook.sync_ticket_status(topic.id, new_status)
           # Close the topic if status is "resolved" or "closed".
           if %w[resolved closed].include?(new_status) && !topic.closed
             topic.update!(closed: true)
@@ -1027,6 +1151,43 @@ after_initialize do
             topic_id: topic.id,
             raw: "🤔 Unknown command `#{cmd}`. Try `@support_bot help`.",
             skip_validations: true,
+          )
+          next
+        end
+      end
+
+      # (f) @lookup command — works in ANY topic (PMs included),
+      # only fires when the actor is in the authors group. Argument
+      # is either a @username or a raw email. Bot replies with a
+      # whisper-style card combining Discourse + quiz-site info.
+      if user.groups.exists?(name: "authors")
+        clean = ::DiscourseQuizbook.strip_markdown(raw)
+        lookup_match =
+          clean.match(/@lookup\s+@?([\w@.\-+]+)/im) ||
+          clean.match(/^lookup\s+@?([\w@.\-+]+)/im)
+        if lookup_match
+          target = lookup_match[1]
+          card = ::DiscourseQuizbook.build_lookup_card(target)
+          # Whisper if possible (staff-only); fall back to a regular
+          # post if whispers are disabled.
+          begin
+            PostCreator.create!(
+              Discourse.system_user,
+              topic_id: topic.id,
+              raw: card,
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+            PostCreator.create!(
+              Discourse.system_user,
+              topic_id: topic.id,
+              raw: card,
+              skip_validations: true,
+            )
+          end
+          ::DiscourseQuizbook.system_log(
+            "🔎 **@#{user.username}** ran lookup on `#{target}` in topic ##{topic.id}"
           )
           next
         end
