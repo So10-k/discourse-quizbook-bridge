@@ -647,6 +647,12 @@ after_initialize do
     begin
       next if post.nil? || user.nil?
       next if user.id == Discourse.system_user.id
+      # CRITICAL: never reprocess the bot's own posts. The bot's
+      # help / response / status messages frequently contain the
+      # literal string "@support_bot" — without this guard the bot
+      # would parse its own output as a new command and infinite-loop.
+      bot_user = ::DiscourseQuizbook.support_bot_user
+      next if bot_user && user.id == bot_user.id
       topic = post.topic
       next unless topic
       raw = post.raw.to_s
@@ -1021,47 +1027,74 @@ after_initialize do
         ticket_cmds = %w[respond reply internalnote note internal changestatus status setstatus]
         if ticket_cmds.include?(cmd) &&
            !(support_cat && topic.category_id == support_cat.id)
-          PostCreator.create!(
-            bot,
-            topic_id: topic.id,
-            raw:
-              "🤔 `#{cmd}` only works inside the **Support Tickets** " \
-              "category. Use `@#{bot.username} lookup [@user|email]` " \
-              "anywhere, or `@#{bot.username} help` for the full list.",
-            skip_validations: true,
-          )
+          # Whisper so it doesn't show on the portal — but the admin
+          # composing the command still sees it on Discourse.
+          begin
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw:
+                "🤔 `#{cmd}` only works inside the **Support Tickets** " \
+                "category. Use `@#{bot.username} lookup [@user|email]` " \
+                "anywhere, or `@#{bot.username} help` for the full list.",
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+            # whispers disabled — silent skip
+          end
           next
         end
 
         case cmd
         when "respond", "reply"
           if body_arg.empty?
-            PostCreator.create!(
-              bot,
-              topic_id: topic.id,
-              raw: "🤔 Usage: `@support_bot respond [message to send to the user]`",
-              skip_validations: true,
-            )
+            # Whisper-style usage hint so it doesn't pollute the
+            # submitter's portal view.
+            begin
+              PostCreator.create!(
+                bot,
+                topic_id: topic.id,
+                raw: "🤔 Usage: `@support_bot respond [message to send to the user]`",
+                post_type: Post.types[:whisper],
+                skip_validations: true,
+              )
+            rescue StandardError
+              # Whispers disabled — silent skip
+            end
             next
           end
-          # 1. Bot acknowledges in the topic with the message it
-          # will email. Visible to admins + (if needed) reviewable.
-          formatted = <<~MD
-            📨 **Response sent to ticket submitter**
+          # 1. Public reply: just the message body, attributed to the
+          # admin who wrote it. The submitter sees this on the portal
+          # as a clean response (no "Response sent" meta wrapper).
+          public_reply = <<~MD.strip
+            **Response from @#{user.username}**
 
-            > #{body_arg.lines.map(&:chomp).join("\n> ")}
-
-            _Sent by @#{user.username} · #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}_
+            #{body_arg}
           MD
           PostCreator.create!(
             bot,
             topic_id: topic.id,
-            raw: formatted,
+            raw: public_reply,
             skip_validations: true,
           )
-          # 2. Tell the quiz site to actually email the recipient.
+          # 2. Whisper confirmation for admins so they know the email
+          # actually went. Hidden from the portal.
+          begin
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw:
+                "✉️ Email queued to **#{topic.custom_fields[TOPIC_FIELD_TICKET_EMAIL]}** " \
+                "via Brevo (sent by @#{user.username}).",
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+          end
+          # 3. Tell the quiz site to actually email the recipient.
           ::DiscourseQuizbook.notify_quiz_site_of_response(topic, body_arg)
-          # 3. Update status to pending if currently open.
+          # 4. Update status to pending if currently open.
           if topic.custom_fields[TOPIC_FIELD_TICKET_STATUS].to_s == "open"
             topic.custom_fields[TOPIC_FIELD_TICKET_STATUS] = "pending"
             topic.save_custom_fields(true)
@@ -1181,29 +1214,43 @@ after_initialize do
           next
 
         when "help"
-          PostCreator.create!(
-            bot,
-            topic_id: topic.id,
-            raw:
-              "**Support bot commands**\n\n" \
-              "_Inside the Support Tickets category:_\n" \
-              "- `@#{bot.username} respond [message]` — emails the ticket submitter\n" \
-              "- `@#{bot.username} internalnote [text]` — adds a staff-only note\n" \
-              "- `@#{bot.username} changestatus [open|pending|resolved|closed]`\n" \
-              "\n_Anywhere on the forum:_\n" \
-              "- `@#{bot.username} lookup [@user|email]` — combined Discourse + quiz-site card\n" \
-              "- `@#{bot.username} help` — this message",
-            skip_validations: true,
-          )
+          # Whisper so the help card stays admin-only.
+          help_body =
+            "**Support bot commands**\n\n" \
+            "_Inside the Support Tickets category:_\n" \
+            "- `@#{bot.username} respond [message]` — emails the ticket submitter\n" \
+            "- `@#{bot.username} internalnote [text]` — adds a staff-only note\n" \
+            "- `@#{bot.username} changestatus [open|pending|resolved|closed]`\n" \
+            "\n_Anywhere on the forum:_\n" \
+            "- `@#{bot.username} lookup [@user|email]` — combined Discourse + quiz-site card\n" \
+            "- `@#{bot.username} help` — this message"
+          begin
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: help_body,
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+            PostCreator.create!(
+              bot, topic_id: topic.id, raw: help_body, skip_validations: true
+            )
+          end
           next
 
         else
-          PostCreator.create!(
-            bot,
-            topic_id: topic.id,
-            raw: "🤔 Unknown command `#{cmd}`. Try `@#{bot.username} help`.",
-            skip_validations: true,
-          )
+          begin
+            PostCreator.create!(
+              bot,
+              topic_id: topic.id,
+              raw: "🤔 Unknown command `#{cmd}`. Try `@#{bot.username} help`.",
+              post_type: Post.types[:whisper],
+              skip_validations: true,
+            )
+          rescue StandardError
+            # whispers disabled — silent skip
+          end
           next
         end
       end
