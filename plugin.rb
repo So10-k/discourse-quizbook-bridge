@@ -314,9 +314,13 @@ after_initialize do
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID, :integer)
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID, :integer)
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_REASON, :string)
-    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM, :boolean)
-    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM, :boolean)
-    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT, :boolean)
+    # NB: register as :string, not :boolean — Discourse's :boolean
+    # type stores values as Postgres "t"/"f" which our SQL queries
+    # below compare against "true"/"false". Using :string keeps the
+    # storage and comparison consistent.
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM, :string)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM, :string)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT, :string)
     Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID, :integer)
   rescue StandardError => e
     Rails.logger.warn("[quizbook] custom_field register failed: #{e.message}")
@@ -367,7 +371,7 @@ after_initialize do
       if topic
         topic.custom_fields[
           ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM
-        ] = true
+        ] = "true"
         topic.save_custom_fields(true)
         user.custom_fields[
           ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID
@@ -594,7 +598,7 @@ after_initialize do
           if new_topic
             new_topic.custom_fields[
               ::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM
-            ] = true
+            ] = "true"
             new_topic.custom_fields[
               ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
             ] = target.id
@@ -682,7 +686,7 @@ after_initialize do
           if audit_topic
             audit_topic.custom_fields[
               ::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT
-            ] = true
+            ] = "true"
             audit_topic.custom_fields[
               ::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID
             ] = user.id
