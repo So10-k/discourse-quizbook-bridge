@@ -460,6 +460,25 @@ after_initialize do
       bot_user = ::DiscourseQuizbook.support_bot_user
       next if bot_user && user.id == bot_user.id
 
+      # Trust-level bump: Discourse Chat is gated to TL1+ by default
+      # (chat_allowed_groups). New users start at TL0, so a brand-new
+      # spectator/player can't see ANY chat channel even after we
+      # add them to the right group. Bump them to TL2 on any
+      # bracket-group add — that's enough for chat + most visibility
+      # gates without making them moderator-adjacent.
+      begin
+        bracket_groups = %w[
+          players spectators alumni predictors semi_finalists
+          finalists champions
+        ]
+        if bracket_groups.include?(group.name) && user.trust_level < 2
+          user.update_column(:trust_level, TrustLevel[2])
+          Rails.logger.info("[quizbook] bumped @#{user.username} to TL2 on join of #{group.name}")
+        end
+      rescue StandardError => e
+        Rails.logger.warn("[quizbook] TL bump failed: #{e.message}")
+      end
+
       # Auto-join chats: find any category whose permissions include
       # this group, and follow that category's chat channel.
       # Iterates ALL group additions, not just NDA — so adding a
