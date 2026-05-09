@@ -493,6 +493,88 @@ after_initialize do
     end
   end
 
+  # Hook 1c: self-heal on every login — if a user is in
+  # pending_finals_nda but somehow doesn't have a NDA PM topic id
+  # (because the :user_added_to_group hook missed them, e.g. they
+  # joined the group while the plugin was reloading), retroactively
+  # send the PM. Same for pending_terms with no terms PM.
+  #
+  # This makes the gate self-correcting: even if the original hook
+  # silently fails, the next time the user shows up they get the PM
+  # they need.
+  DiscourseEvent.on(:user_logged_in) do |user|
+    begin
+      next unless user
+      next if user.id == Discourse.system_user.id
+
+      # Finals NDA self-heal
+      nda_group = Group.find_by(name: ::DiscourseQuizbook::FINALS_NDA_GROUP)
+      if nda_group && nda_group.users.exists?(id: user.id)
+        existing = user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID
+        ].to_i
+        if existing == 0 || !Topic.where(id: existing).exists?
+          result = PostCreator.create!(
+            Discourse.system_user,
+            title: ::DiscourseQuizbook::FINALS_NDA_TITLE,
+            raw: ::DiscourseQuizbook::FINALS_NDA_BODY,
+            archetype: Archetype.private_message,
+            target_usernames: user.username,
+            skip_validations: true,
+          )
+          topic = result&.topic
+          if topic
+            topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_IS_FINALS_NDA_PM
+            ] = "true"
+            topic.save_custom_fields(true)
+            user.custom_fields[
+              ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID
+            ] = topic.id
+            user.save_custom_fields(true)
+            ::DiscourseQuizbook.system_log(
+              "🩹 self-heal: sent missing NDA PM to **@#{user.username}** (topic ##{topic.id})"
+            )
+          end
+        end
+      end
+
+      # Terms PM self-heal — same pattern.
+      terms_group = Group.find_by(name: ::DiscourseQuizbook::HOLDING_GROUP)
+      if terms_group && terms_group.users.exists?(id: user.id)
+        existing = user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID
+        ].to_i
+        if existing == 0 || !Topic.where(id: existing).exists?
+          result = PostCreator.create!(
+            Discourse.system_user,
+            title: ::DiscourseQuizbook::TERMS_PM_TITLE,
+            raw: ::DiscourseQuizbook::TERMS_PM_BODY,
+            archetype: Archetype.private_message,
+            target_usernames: user.username,
+            skip_validations: true,
+          )
+          topic = result&.topic
+          if topic
+            topic.custom_fields[
+              ::DiscourseQuizbook::TOPIC_FIELD_IS_TERMS_PM
+            ] = "true"
+            topic.save_custom_fields(true)
+            user.custom_fields[
+              ::DiscourseQuizbook::USER_FIELD_TERMS_PM_TOPIC_ID
+            ] = topic.id
+            user.save_custom_fields(true)
+            ::DiscourseQuizbook.system_log(
+              "🩹 self-heal: sent missing terms PM to **@#{user.username}** (topic ##{topic.id})"
+            )
+          end
+        end
+      end
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] self-heal hook failed: #{e.message}")
+    end
+  end
+
   # Helpers live on the ::DiscourseQuizbook module itself. The
   # surrounding `def self.X` syntax doesn't work here because inside
   # the `after_initialize do ... end` block, `self` is the Plugin
