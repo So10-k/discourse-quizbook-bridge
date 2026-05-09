@@ -448,15 +448,36 @@ after_initialize do
 
   # Hook 1b: when a user gets added to the pending_finals_nda group
   # (via SSO add_groups), send them the finals confidentiality PM.
+  # Also auto-joins them to category chat channels gated to whatever
+  # group they were just added to, so they don't have to manually
+  # click "join" on every chat.
   # Idempotent — won't re-send if they already have an NDA PM topic
   # id stamped on their custom_fields.
   DiscourseEvent.on(:user_added_to_group) do |user, group, _opts|
     begin
       next unless user && group
-      next unless group.name == ::DiscourseQuizbook::FINALS_NDA_GROUP
       next if user.id == Discourse.system_user.id
       bot_user = ::DiscourseQuizbook.support_bot_user
       next if bot_user && user.id == bot_user.id
+
+      # Auto-join chats: find any category whose permissions include
+      # this group, and follow that category's chat channel.
+      # Iterates ALL group additions, not just NDA — so adding a
+      # user to authors auto-joins them to Staff Chat, etc.
+      begin
+        if defined?(Chat) && defined?(Chat::Channel)
+          CategoryGroup.where(group_id: group.id).find_each do |cg|
+            cat = Category.find_by(id: cg.category_id)
+            next unless cat
+            ::DiscourseQuizbook.auto_join_category_chat(user, cat.slug)
+          end
+        end
+      rescue StandardError => e
+        Rails.logger.warn("[quizbook] auto-join chat sweep failed: #{e.message}")
+      end
+
+      # Below is the NDA-PM-specific logic — only runs for NDA group.
+      next unless group.name == ::DiscourseQuizbook::FINALS_NDA_GROUP
 
       existing = user.custom_fields[
         ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID
@@ -708,6 +729,31 @@ after_initialize do
       quiz_site_post("/api/forum/finals-nda-agreed", payload)
     end
 
+    # Auto-follow a category's chat channel for the given user.
+    # Discourse's Chat plugin doesn't auto-add users to channels by
+    # default — they have to manually click "join". This bypasses
+    # that for situations where group membership SHOULD imply chat
+    # access (Finals Room for finalists, Staff Chat for authors,
+    # etc.).
+    def self.auto_join_category_chat(user, category_slug)
+      return unless defined?(Chat) && defined?(Chat::Channel)
+      cat = Category.find_by(slug: category_slug)
+      return unless cat
+      channel = Chat::Channel.where(chatable_type: "Category", chatable_id: cat.id).first
+      return unless channel
+      membership =
+        Chat::UserChatChannelMembership.find_or_initialize_by(
+          user_id: user.id,
+          chat_channel_id: channel.id,
+        )
+      membership.following = true
+      membership.notification_level = 2 if membership.respond_to?(:notification_level=)
+      membership.save!
+      Rails.logger.info("[quizbook] auto-joined @#{user.username} to chat ##{channel.id} (#{cat.slug})")
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] auto-join chat failed: #{e.message}")
+    end
+
     # Build the Markdown body of a lookup card. `target` is either a
     # username (with optional @) or a raw email. Combines Discourse
     # data + quiz-site data via lookup_quiz_user.
@@ -902,12 +948,26 @@ after_initialize do
             nda_group.remove(user)
             nda_group.save!
           end
+          # Now grant the actual access group. `finalists` is what
+          # gates the Finals Room category — without this, the user
+          # can't see the category until their next SSO login. With
+          # it, access is immediate.
+          finalists_group = Group.find_by(name: "finalists")
+          if finalists_group && !finalists_group.users.exists?(id: user.id)
+            finalists_group.add(user)
+            finalists_group.save!
+          end
           user.custom_fields[
             ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_AGREED_AT
           ] = Time.now.utc.iso8601
           user.save_custom_fields(true)
           # Persist on quiz-site DB so future SSO logins respect it.
           ::DiscourseQuizbook.notify_finals_nda_agreed(user)
+          # Auto-follow the Finals Room chat channel so the user
+          # doesn't have to manually click "join". Failures are
+          # non-fatal — the user can still see the channel and
+          # join manually.
+          ::DiscourseQuizbook.auto_join_category_chat(user, "finals-room")
 
           PostCreator.create!(
             Discourse.system_user,
