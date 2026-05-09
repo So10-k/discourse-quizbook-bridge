@@ -301,6 +301,15 @@ after_initialize do
 
       You're seeing this because the bracket has placed you in the **finals** of *Mia's Quiz Tournament*. Before we can hand you the key to the back room, you need to agree to the finals confidentiality terms.
 
+      ### 👋 First time on a forum?
+      We made you a step-by-step picture guide. It walks you through clicking around, finding this message, agreeing, and getting into the back room:
+
+      **➡️ [Open the walkthrough](https://quiz.miaswebsites.art/forum-guide)**
+
+      Keep it open in another tab and follow along.
+
+      ---
+
       ### 📜 The terms
       1. **Don't share, leak, or paraphrase anything** that happens in the Finals Room — including the topic of the questions, the format details, scheduling, or anything you read in the Finalist Briefing.
       2. **Don't compare notes** with anyone, including the other finalist in your bracket. Talk through the host or in Finals Room only.
@@ -321,9 +330,18 @@ after_initialize do
     TERMS_PM_BODY = <<~MD.freeze
       Hi there, and welcome to **Mia's Quiz Discuss**! 🌞
 
-      Before you can use the rest of the forum, please take a moment to agree to a few simple things:
+      ### 👋 First time on a forum?
+      We made you a step-by-step picture guide. It walks you through everything you need to do here:
+
+      **➡️ [Open the walkthrough](https://quiz.miaswebsites.art/forum-guide)**
+
+      It opens in a new tab — keep it next to this message and follow along.
+
+      ---
 
       ### 📜 The Quick Terms
+      Before you can use the rest of the forum, please agree to a few simple things:
+
       1. **Be kind.** This is a family-friendly tournament forum.
       2. **No spam, no ads, no off-topic links.**
       3. **Mia and Sam (the authors) have final say on disputes.**
@@ -761,6 +779,19 @@ after_initialize do
           user.custom_fields[::DiscourseQuizbook::USER_FIELD_TERMS_AGREED_AT] =
             Time.now.utc.iso8601
           user.save_custom_fields(true)
+          # If they're also in pending_finals_nda, give them a heads-up
+          # that there's a second message waiting — otherwise they bounce
+          # straight from this PM to the NDA PM and might be confused
+          # why the gate didn't fully release.
+          nda_group = Group.find_by(name: ::DiscourseQuizbook::FINALS_NDA_GROUP)
+          is_pending_finalist =
+            nda_group && nda_group.users.exists?(id: user.id)
+          extra_note =
+            if is_pending_finalist
+              "\n\n---\n\n**One more step:** because you've also been seated in the *finals*, there's a second message in your inbox — \"🔒 Finals access — confidentiality required\" — you need to agree to that one too. Open it next."
+            else
+              ""
+            end
           PostCreator.create!(
             Discourse.system_user,
             topic_id: topic.id,
@@ -768,11 +799,11 @@ after_initialize do
               "🎉 You're in! Thanks for agreeing — you now have full access " \
               "to the forum. Have fun, and check out the [tournament " \
               "bracket](https://quiz.miaswebsites.art/standings) when you " \
-              "get a chance.",
+              "get a chance." + extra_note,
             skip_validations: true,
           )
           ::DiscourseQuizbook.system_log(
-            "✅ **@#{user.username}** agreed to terms — removed from `pending_terms`"
+            "✅ **@#{user.username}** agreed to terms — removed from `pending_terms`#{is_pending_finalist ? " (also pending NDA)" : ""}"
           )
         end
         next
