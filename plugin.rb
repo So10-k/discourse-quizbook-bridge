@@ -316,7 +316,6 @@ after_initialize do
 
       — The Quiz Book team
     MD
-  end
 
     TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
     TERMS_PM_BODY = <<~MD.freeze
