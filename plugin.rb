@@ -291,6 +291,33 @@ after_initialize do
     SUPPORT_BOT_USERNAME = "support_bot"
     TICKET_STATUSES = %w[open pending resolved closed].freeze
 
+    FINALS_NDA_GROUP = "pending_finals_nda"
+    USER_FIELD_FINALS_NDA_PM_TOPIC_ID = "qb_finals_nda_pm_topic_id"
+    USER_FIELD_FINALS_NDA_AGREED_AT = "qb_finals_nda_agreed_at"
+    TOPIC_FIELD_IS_FINALS_NDA_PM = "qb_is_finals_nda_pm"
+    FINALS_NDA_TITLE = "🔒 Finals access — confidentiality required"
+    FINALS_NDA_BODY = <<~MD.freeze
+      Hi,
+
+      You're seeing this because the bracket has placed you in the **finals** of *Mia's Quiz Tournament*. Before we can hand you the key to the back room, you need to agree to the finals confidentiality terms.
+
+      ### 📜 The terms
+      1. **Don't share, leak, or paraphrase anything** that happens in the Finals Room — including the topic of the questions, the format details, scheduling, or anything you read in the Finalist Briefing.
+      2. **Don't compare notes** with anyone, including the other finalist in your bracket. Talk through the host or in Finals Room only.
+      3. **Don't research the format or the question pool**. The show works because of your reactions, not your prep.
+      4. **The host has final say** on disputes about format, timing, or content. By agreeing here, you accept that.
+      5. These terms apply both before AND after the broadcast. Even after the championship, do not redistribute the briefing or any internal coordination material.
+
+      ---
+
+      To accept and unlock the **Finals Room** category (where coordination and the Finalist Briefing live), **reply to this message with "yes I agree"**.
+
+      If anything's unclear, reply with your question instead — we'll see it before agreement is recorded.
+
+      — The Quiz Book team
+    MD
+  end
+
     TERMS_PM_TITLE = "🌞 Welcome — please agree to continue"
     TERMS_PM_BODY = <<~MD.freeze
       Hi there, and welcome to **Mia's Quiz Discuss**! 🌞
@@ -321,6 +348,8 @@ after_initialize do
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID, :integer)
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_AUDIT_TOPIC_ID, :integer)
     User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_REVIEW_REASON, :string)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID, :integer)
+    User.register_custom_field_type(::DiscourseQuizbook::USER_FIELD_FINALS_NDA_AGREED_AT, :string)
     # NB: register as :string, not :boolean — Discourse's :boolean
     # type stores values as Postgres "t"/"f" which our SQL queries
     # below compare against "true"/"false". Using :string keeps the
@@ -329,6 +358,7 @@ after_initialize do
     Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_PM, :string)
     Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_REVIEW_AUDIT, :string)
     Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_REVIEW_TARGET_ID, :integer)
+    Topic.register_custom_field_type(::DiscourseQuizbook::TOPIC_FIELD_IS_FINALS_NDA_PM, :string)
   rescue StandardError => e
     Rails.logger.warn("[quizbook] custom_field register failed: #{e.message}")
   end
@@ -350,6 +380,12 @@ after_initialize do
   end
   add_to_serializer(:current_user, :qb_review_pm_topic_id) do
     object.custom_fields[::DiscourseQuizbook::USER_FIELD_REVIEW_PM_TOPIC_ID]
+  end
+  add_to_serializer(:current_user, :qb_is_pending_finals_nda) do
+    object.groups.exists?(name: ::DiscourseQuizbook::FINALS_NDA_GROUP)
+  end
+  add_to_serializer(:current_user, :qb_finals_nda_pm_topic_id) do
+    object.custom_fields[::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID]
   end
 
   # Hook 1: a new user account exists → drop them into the holding
@@ -390,6 +426,53 @@ after_initialize do
       end
     rescue StandardError => e
       Rails.logger.warn("[quizbook] terms PM creation failed: #{e.message}")
+    end
+  end
+
+  # Hook 1b: when a user gets added to the pending_finals_nda group
+  # (via SSO add_groups), send them the finals confidentiality PM.
+  # Idempotent — won't re-send if they already have an NDA PM topic
+  # id stamped on their custom_fields.
+  DiscourseEvent.on(:user_added_to_group) do |user, group, _opts|
+    begin
+      next unless user && group
+      next unless group.name == ::DiscourseQuizbook::FINALS_NDA_GROUP
+      next if user.id == Discourse.system_user.id
+      bot_user = ::DiscourseQuizbook.support_bot_user
+      next if bot_user && user.id == bot_user.id
+
+      existing = user.custom_fields[
+        ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID
+      ].to_i
+      if existing > 0 && Topic.where(id: existing).exists?
+        # Already sent. Skip.
+        next
+      end
+
+      result = PostCreator.create!(
+        Discourse.system_user,
+        title: ::DiscourseQuizbook::FINALS_NDA_TITLE,
+        raw: ::DiscourseQuizbook::FINALS_NDA_BODY,
+        archetype: Archetype.private_message,
+        target_usernames: user.username,
+        skip_validations: true,
+      )
+      topic = result&.topic
+      if topic
+        topic.custom_fields[
+          ::DiscourseQuizbook::TOPIC_FIELD_IS_FINALS_NDA_PM
+        ] = "true"
+        topic.save_custom_fields(true)
+        user.custom_fields[
+          ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_PM_TOPIC_ID
+        ] = topic.id
+        user.save_custom_fields(true)
+        ::DiscourseQuizbook.system_log(
+          "🔒 **@#{user.username}** entered finals NDA gate — sent confidentiality PM (topic ##{topic.id})"
+        )
+      end
+    rescue StandardError => e
+      Rails.logger.warn("[quizbook] finals NDA PM creation failed: #{e.message}")
     end
   end
 
@@ -514,6 +597,16 @@ after_initialize do
     # external_id. Returns the parsed JSON or nil.
     def self.lookup_quiz_user(identifier)
       quiz_site_post("/api/forum/lookup", { identifier: identifier })
+    end
+
+    # Stamp the finals NDA agreement on the quiz-site users row. The
+    # plugin calls this when a finalist replies "yes / agree" in their
+    # NDA PM. The next SSO login then drops them from the
+    # pending_finals_nda holding-zone group.
+    def self.notify_finals_nda_agreed(user)
+      ssr = SingleSignOnRecord.find_by(user_id: user.id)
+      payload = { external_id: ssr&.external_id, email: user.email }
+      quiz_site_post("/api/forum/finals-nda-agreed", payload)
     end
 
     # Build the Markdown body of a lookup card. `target` is either a
@@ -681,6 +774,41 @@ after_initialize do
           )
           ::DiscourseQuizbook.system_log(
             "✅ **@#{user.username}** agreed to terms — removed from `pending_terms`"
+          )
+        end
+        next
+      end
+
+      # (a2) finals NDA PM agreement — same shape as terms but
+      # different group + writes the agreement back to the quiz site
+      # so the SSO flow stops including pending_finals_nda.
+      if topic.archetype == Archetype.private_message &&
+         topic.custom_fields[::DiscourseQuizbook::TOPIC_FIELD_IS_FINALS_NDA_PM]
+        if raw =~ /\byes\b/i || raw =~ /\b(agree|agreed)\b/i
+          nda_group = Group.find_by(name: ::DiscourseQuizbook::FINALS_NDA_GROUP)
+          if nda_group && nda_group.users.exists?(id: user.id)
+            nda_group.remove(user)
+            nda_group.save!
+          end
+          user.custom_fields[
+            ::DiscourseQuizbook::USER_FIELD_FINALS_NDA_AGREED_AT
+          ] = Time.now.utc.iso8601
+          user.save_custom_fields(true)
+          # Persist on quiz-site DB so future SSO logins respect it.
+          ::DiscourseQuizbook.notify_finals_nda_agreed(user)
+
+          PostCreator.create!(
+            Discourse.system_user,
+            topic_id: topic.id,
+            raw:
+              "🔓 Agreed and recorded. Welcome to the back room.\n\n" \
+              "You can now post in the **[Finals Room](#{::DiscourseQuizbook::QUIZ_BASE.sub("quiz", "discuss")}/c/finals-room)** category. " \
+              "There's a pinned **Finalist Briefing** topic there — read it once, top to bottom, then drop a 👍 reply so we know you're up to speed.\n\n" \
+              "Confidentiality applies from this moment forward.",
+            skip_validations: true,
+          )
+          ::DiscourseQuizbook.system_log(
+            "🔒 **@#{user.username}** agreed to finals NDA — removed from `pending_finals_nda`"
           )
         end
         next
